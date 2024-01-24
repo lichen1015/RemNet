@@ -13,7 +13,7 @@ classes = ("pedestrian", "people", "bicycle", "car", "van", "truck", "tricycle",
 
 num_classes = len(classes)  # Number of classes for classification
 # Batch size of a single GPU during training
-train_batch_size_per_gpu = 1
+train_batch_size_per_gpu = 8
 # Worker to pre-fetch data for each single GPU during training
 train_num_workers = 8
 # persistent_workers must be False if num_workers is 0

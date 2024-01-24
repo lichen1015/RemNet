@@ -2,8 +2,7 @@ _base_ = ['./base/default_runtime.py', './base/det_p5_tta.py']
 
 # ========================Frequently modified parameters======================
 # -----data related-----
-# data_root = '/mnt/datasets/VisDrone2019-DET-COCO/'  # Root path of data
-data_root = 'E:/datasets/VisDrone2019-DET-COCO/'  # Root path of data
+data_root = '/mnt/datasets/VisDrone2019-DET-COCO/'  # Root path of data
 # Path of train annotation file
 train_ann_file = 'annotations/VisDrone2019-DET_train_coco.json'
 train_data_prefix = 'train2019/'  # Prefix of train image path

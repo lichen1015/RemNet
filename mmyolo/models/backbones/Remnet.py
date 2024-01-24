@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Union, List, Tuple
+from typing import Union, List, Tuple, Optional
 
 from mmdet.utils import ConfigType, OptMultiConfig
 from .csp_darknet import CSPLayerWithTwoConv
@@ -8,11 +8,14 @@ from mmyolo.models.utils import make_divisible, make_round
 from timm.layers import DropPath, LayerNorm2d
 from .base_backbone import BaseBackbone
 from mmyolo.registry import MODELS
-from torch import nn
+from torch import nn, Tensor
 import torch
 import torch.nn.functional as F
-from mmcv.cnn import ConvModule as v8ConvModule
+from mmcv.cnn import ConvModule as v8ConvModule, build_norm_layer
 from einops import rearrange
+import numpy as np
+
+from mmcv.cnn import ConvModule as ModelConv
 
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation
@@ -71,89 +74,213 @@ def get_norm(norm_layer='in_1d'):
     return norm_dict[norm_layer]
 
 
-class Conv2d_BN(nn.Sequential):
-    def __init__(self, inp, oup, ks=1, stride=1, pad=0, dilation=1,
-                 groups=1, bn_weight_init=1, resolution=-10000):
+class RepDWBlock(nn.Module):
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride=1,
+                 padding=1,
+                 dilation=1,
+                 groups=1,
+                 padding_mode='zeros',
+                 norm_cfg: ConfigType = dict(
+                     type='BN', momentum=0.03, eps=0.001),
+                 act_cfg: ConfigType = dict(type='ReLU', inplace=True),
+                 use_se: bool = False,
+                 use_alpha: bool = False,
+                 use_bn_first=True,
+                 deploy: bool = False):
         super().__init__()
-        self.add_module('c', nn.Conv2d(
-            inp, oup, ks, stride, pad, dilation, groups, bias=False))
-        self.add_module('bn', torch.nn.BatchNorm2d(oup))
-        nn.init.constant_(self.bn.weight, bn_weight_init)
-        nn.init.constant_(self.bn.bias, 0)
+        self.deploy = deploy
+        self.groups = groups
+        self.in_channels = in_channels
+        self.out_channels = out_channels
 
-    @torch.no_grad()
-    def fuse(self):
-        c, bn = self._modules.values()
-        w = bn.weight / (bn.running_var + bn.eps) ** 0.5
-        w = c.weight * w[:, None, None, None]
-        b = bn.bias - bn.running_mean * bn.weight / \
-            (bn.running_var + bn.eps) ** 0.5
-        m = nn.Conv2d(w.size(1) * self.c.groups, w.size(
-            0), w.shape[2:], stride=self.c.stride, padding=self.c.padding, dilation=self.c.dilation,
-                      groups=self.c.groups,
-                      device=c.weight.device)
-        m.weight.data.copy_(w)
-        m.bias.data.copy_(b)
-        return m
+        assert kernel_size == 3
+        assert padding == 1
 
+        padding_11 = padding - kernel_size // 2
 
-class DW_1x1(torch.nn.Module):
-    def __init__(self, ed) -> None:
-        super().__init__()
-        self.conv = Conv2d_BN(ed, ed, 3, 1, 1, groups=ed)
-        self.conv1 = nn.Conv2d(ed, ed, 1, 1, 0, groups=1)
-        self.dim = ed
-        self.bn = nn.BatchNorm2d(ed)
+        self.nonlinearity = MODELS.build(act_cfg)
 
-    def forward(self, x):
-        return self.bn((self.conv(x) + self.conv1(x)) + x)
+        if use_se:
+            raise NotImplementedError('se block not supported yet')
+        else:
+            self.se = nn.Identity()
 
+        if use_alpha:
+            alpha = torch.ones([
+                1,
+            ], dtype=torch.float32, requires_grad=True)
+            self.alpha = nn.Parameter(alpha, requires_grad=True)
+        else:
+            self.alpha = None
 
-class RepDW(torch.nn.Module):
-    def __init__(self, ed) -> None:
-        super().__init__()
-        self.conv = Conv2d_BN(ed, ed, 3, 1, 1, groups=ed)
-        self.conv1 = nn.Conv2d(ed, ed, 1, 1, 0, groups=ed)
-        self.dim = ed
-        self.bn = nn.BatchNorm2d(ed)
+        if deploy:
+            self.rbr_reparam = nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+                bias=True,
+                padding_mode=padding_mode)
 
-    def forward(self, x):
-        return self.bn((self.conv(x) + self.conv1(x)) + x)
+        else:
+            if use_bn_first and (out_channels == in_channels) and stride == 1:
+                self.rbr_identity = build_norm_layer(
+                    norm_cfg, num_features=in_channels)[1]
+            else:
+                self.rbr_identity = None
 
-    @torch.no_grad()
-    def fuse(self):
-        conv = self.conv.fuse()
-        conv1 = self.conv1
+            self.rbr_dense = ModelConv(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                groups=groups,
+                bias=False,
+                norm_cfg=norm_cfg,
+                act_cfg=None)
+            self.rbr_1x1 = ModelConv(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=1,
+                stride=stride,
+                padding=padding_11,
+                groups=groups,
+                bias=False,
+                norm_cfg=norm_cfg,
+                act_cfg=None)
 
-        conv_w = conv.weight
-        conv_b = conv.bias
-        conv1_w = conv1.weight
-        conv1_b = conv1.bias
+    def forward(self, inputs: Tensor) -> Tensor:
+        """Forward process.
+        Args:
+            inputs (Tensor): The input tensor.
 
-        conv1_w = F.pad(conv1_w, [1, 1, 1, 1])
+        Returns:
+            Tensor: The output tensor.
+        """
+        if hasattr(self, 'rbr_reparam'):
+            return self.nonlinearity(self.se(self.rbr_reparam(inputs)))
 
-        identity = F.pad(torch.ones(conv1_w.shape[0], conv1_w.shape[1], 1, 1, device=conv1_w.device),
-                         [1, 1, 1, 1])
+        if self.rbr_identity is None:
+            id_out = 0
+        else:
+            id_out = self.rbr_identity(inputs)
+        if self.alpha:
+            return self.nonlinearity(
+                self.se(
+                    self.rbr_dense(inputs) +
+                    self.alpha * self.rbr_1x1(inputs) + id_out))
+        else:
+            return self.nonlinearity(
+                self.se(
+                    self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out))
 
-        final_conv_w = conv_w + conv1_w + identity
-        final_conv_b = conv_b + conv1_b
+    def get_equivalent_kernel_bias(self):
+        """Derives the equivalent kernel and bias in a differentiable way.
 
-        conv.weight.data.copy_(final_conv_w)
-        conv.bias.data.copy_(final_conv_b)
+        Returns:
+            tuple: Equivalent kernel and bias
+        """
+        kernel3x3, bias3x3 = self._fuse_bn_tensor(self.rbr_dense)
+        kernel1x1, bias1x1 = self._fuse_bn_tensor(self.rbr_1x1)
+        kernelid, biasid = self._fuse_bn_tensor(self.rbr_identity)
+        if self.alpha:
+            return kernel3x3 + self.alpha * self._pad_1x1_to_3x3_tensor(
+                kernel1x1) + kernelid, bias3x3 + self.alpha * bias1x1 + biasid
+        else:
+            return kernel3x3 + self._pad_1x1_to_3x3_tensor(
+                kernel1x1) + kernelid, bias3x3 + bias1x1 + biasid
 
-        bn = self.bn
-        w = bn.weight / (bn.running_var + bn.eps) ** 0.5
-        w = conv.weight * w[:, None, None, None]
-        b = bn.bias + (conv.bias - bn.running_mean) * bn.weight / \
-            (bn.running_var + bn.eps) ** 0.5
-        conv.weight.data.copy_(w)
-        conv.bias.data.copy_(b)
-        return conv
+    def _pad_1x1_to_3x3_tensor(self, kernel1x1):
+        """Pad 1x1 tensor to 3x3.
+        Args:
+            kernel1x1 (Tensor): The input 1x1 kernel need to be padded.
+
+        Returns:
+            Tensor: 3x3 kernel after padded.
+        """
+        if kernel1x1 is None:
+            return 0
+        else:
+            return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
+
+    def _fuse_bn_tensor(self, branch: nn.Module) -> Tuple[np.ndarray, Tensor]:
+        """Derives the equivalent kernel and bias of a specific branch layer.
+
+        Args:
+            branch (nn.Module): The layer that needs to be equivalently
+                transformed, which can be nn.Sequential or nn.Batchnorm2d
+
+        Returns:
+            tuple: Equivalent kernel and bias
+        """
+        if branch is None:
+            return 0, 0
+        if isinstance(branch, ConvModule):
+            kernel = branch.conv.weight
+            running_mean = branch.bn.running_mean
+            running_var = branch.bn.running_var
+            gamma = branch.bn.weight
+            beta = branch.bn.bias
+            eps = branch.bn.eps
+        else:
+            assert isinstance(branch, (nn.SyncBatchNorm, nn.BatchNorm2d))
+            if not hasattr(self, 'id_tensor'):
+                input_dim = self.in_channels // self.groups
+                kernel_value = np.zeros((self.in_channels, input_dim, 3, 3),
+                                        dtype=np.float32)
+                for i in range(self.in_channels):
+                    kernel_value[i, i % input_dim, 1, 1] = 1
+                self.id_tensor = torch.from_numpy(kernel_value).to(
+                    branch.weight.device)
+            kernel = self.id_tensor
+            running_mean = branch.running_mean
+            running_var = branch.running_var
+            gamma = branch.weight
+            beta = branch.bias
+            eps = branch.eps
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta - running_mean * gamma / std
+
+    def switch_to_deploy(self):
+        """Switch to deploy mode."""
+        if hasattr(self, 'rbr_reparam'):
+            return
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.rbr_reparam = nn.Conv2d(
+            in_channels=self.rbr_dense.conv.in_channels,
+            out_channels=self.rbr_dense.conv.out_channels,
+            kernel_size=self.rbr_dense.conv.kernel_size,
+            stride=self.rbr_dense.conv.stride,
+            padding=self.rbr_dense.conv.padding,
+            dilation=self.rbr_dense.conv.dilation,
+            groups=self.rbr_dense.conv.groups,
+            bias=True)
+        self.rbr_reparam.weight.data = kernel
+        self.rbr_reparam.bias.data = bias
+        for para in self.parameters():
+            para.detach_()
+        self.__delattr__('rbr_dense')
+        self.__delattr__('rbr_1x1')
+        if hasattr(self, 'rbr_identity'):
+            self.__delattr__('rbr_identity')
+        if hasattr(self, 'id_tensor'):
+            self.__delattr__('id_tensor')
+        self.deploy = True
 
 
 class CED(nn.Module):
     """
-    split channel for down sample
+    Stride Shuffle for down sample
     """
 
     def __init__(self, dim_in, dim_out, exp_ratio, kernel_size, act_layer='relu', use_ca=1, dropout=0.):
@@ -171,8 +298,7 @@ class CED(nn.Module):
 
         self.channel_attn = nn.Identity()
         self.pw_linear = ConvModule(self.split_dims, dim_out, kernel_size=1, stride=stride, bias=False,
-                                    norm_layer='bn_2d',
-                                    act_layer='none')
+                                    norm_layer='bn_2d', act_layer='none')
         # residual
         self.conv_down_sample = None
         if dim_in != dim_out:
@@ -191,7 +317,6 @@ class CED(nn.Module):
         x = self.conv_1x1(x)
         x = self.dw_conv(x)
         x = rearrange(x, 'b d (h n1) (w n2) -> b (d n1 n2) h w', n1=2, n2=2).contiguous()
-        # x = torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]], dim=1)
         x = self.channel_attn(x)
         x = self.pw_linear(x)
         if self.conv_down_sample is not None:
@@ -208,14 +333,14 @@ class IMRDB(nn.Module):
 
         if dim_in == self.hidden_dims:
             self.conv_1x1 = nn.Identity()
-            self.dw_conv = RepDW(self.hidden_dims)
+            self.dw_conv = RepDWBlock(self.hidden_dims, self.hidden_dims, kernel_size, groups=self.hidden_dims)
             self.act = get_act(act_layer)()
             self.pw_linear = ConvModule(self.hidden_dims, dim_out, 1, 1, bias=False, act_layer='none',
                                         norm_layer='bn_2d')
         else:
             self.conv_1x1 = ConvModule(dim_in, self.hidden_dims, 1, 1, groups=1, bias=False,
                                        norm_layer='bn_2d', act_layer=act_layer)
-            self.dw_conv = RepDW(self.hidden_dims)
+            self.dw_conv = RepDWBlock(self.hidden_dims, self.hidden_dims, kernel_size, groups=self.hidden_dims)
             self.act = get_act(act_layer)()
             self.pw_linear = ConvModule(self.hidden_dims, dim_out, 1, 1, groups=1, bias=False, norm_layer='bn_2d',
                                         act_layer='none')

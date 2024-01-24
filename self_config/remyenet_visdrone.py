@@ -13,7 +13,7 @@ classes = ("pedestrian", "people", "bicycle", "car", "van", "truck", "tricycle",
 
 num_classes = len(classes)  # Number of classes for classification
 # Batch size of a single GPU during training
-train_batch_size_per_gpu = 3
+train_batch_size_per_gpu = 4
 # Worker to pre-fetch data for each single GPU during training
 train_num_workers = 8
 # persistent_workers must be False if num_workers is 0
@@ -42,9 +42,9 @@ img_scale = (640, 640)  # width, height
 dataset_type = 'YOLOv5CocoDataset'
 
 # Batch size of a single GPU during validation
-val_batch_size_per_gpu = 1
+val_batch_size_per_gpu = 2
 # Worker to pre-fetch data for each single GPU during validation
-val_num_workers = 2
+val_num_workers = 4
 
 # Config of batch shapes. Only on val.
 # We tested YOLOv8-m will get 0.02 higher than not using it.
@@ -69,10 +69,11 @@ batch_shapes_cfg = None
 deepen_factor = 0.33
 widen_factor = 0.25
 
-# Strides of multi-scale prior bo
+# Strides of multi-scale prior box
 strides = [4, 8, 16, 32]
 # strides = [8, 16, 32]
-channel_oup = [128, 256, 512, 1024]
+out_indices = [1, 2, 3, 4]
+fpn_channel = [128, 256, 512, 1024]
 # The output channel of the last stage
 last_stage_out_channels = 1024
 num_det_layers = 3  # The number of model output scales
@@ -112,15 +113,21 @@ model = dict(
         std=[255., 255., 255.],
         bgr_to_rgb=True),
     backbone=dict(
-        type='mecnet_small',
-        out_indices=[1, 2, 3, 4],
+        type='RemNet',
+        out_indices=out_indices,
+        arch='P5',
+        last_stage_out_channels=last_stage_out_channels,
+        deepen_factor=deepen_factor,
+        widen_factor=widen_factor,
+        norm_cfg=norm_cfg,
+        act_cfg=dict(type='SiLU', inplace=True)
     ),
     neck=dict(
         type='YOLOv8PAFPN',
         deepen_factor=deepen_factor,
         widen_factor=widen_factor,
-        in_channels=channel_oup,
-        out_channels=channel_oup,
+        in_channels=fpn_channel,
+        out_channels=fpn_channel,
         num_csp_blocks=3,
         norm_cfg=norm_cfg,
         act_cfg=dict(type='SiLU', inplace=True)),
@@ -129,7 +136,7 @@ model = dict(
         head_module=dict(
             type='YOLOv8HeadModule',
             num_classes=num_classes,
-            in_channels=channel_oup,
+            in_channels=fpn_channel,
             widen_factor=widen_factor,
             reg_max=16,
             norm_cfg=norm_cfg,

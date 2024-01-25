@@ -3,16 +3,17 @@ the official implementation  of "RemNet: A lightweight backbone for UAV Object D
 
 # Environments
 ```shell
-conda create -n remnet python=3.11 pytorch==2.0.1 torchvision==0.11.2 cudatoolkit=11.7 -c pytorch -y
+conda create -n remnet python=3.11 -y
 conda activate remnet
 pip3 install torch torchvision torchaudio # match your cuda version
-pip install openmim
+pip install -U openmim
 mim install "mmengine>=0.6.0"
 mim install "mmcv>=2.0.0rc4,<2.1.0"
 mim install "mmdet>=3.0.0,<3.1.0"
 pip install -r requirements.txt
-pip install einops timm
+pip install einops timm albumentations
 mim install -v -e .
+python setup.py install
 ```
 
 # Prepare VisDrone2019-DET Dataset
